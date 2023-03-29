@@ -4,6 +4,15 @@
 #include <cuda_fp16.h>
 #include <iostream>
 
+/*
+IMPORTANT LESSONS
+0. cudnnActivationForward needs a f32 alpha and beta when using f16 input and output
+1. cudnnConvolutionForward needs a f32 alpha and beta when using f16 input and output
+2. cublasGemmStridedBatchedEx needs a f16 alpha and beta when using f16 input and output
+3. cublasAxpyEx needs a f32 alpha and beta when using f16 input and output
+4. cudnnSoftmaxForward needs a f32 alpha and beta when using f16 input and output
+*/
+
 void PrintMatrixF16(__half* arr, uint32_t rows, uint32_t cols, const char* label)
 {
 printf("%s:\n", label);
@@ -29,19 +38,6 @@ void CurandGenerateUniformF16(curandGenerator_t generator, __half* output, uint3
 	CurandNormalizeF16 << <std::ceil(0.0009765625f * size), 1024 >> > (output, size, min, (max - min) * 0.0000152590218967f);
 }
 
-__global__ void GpuReluF16(__half* input, __half* output, uint32_t size)
-{
-	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index < size && *(uint16_t*)(input + index) >> 15)
-		output[index] = 0x0000;
-}
-
-void ReluF16(__half* input, __half* output, uint32_t size)
-{
-	cudaMemcpy(output, input, size << 1, cudaMemcpyDeviceToDevice);
-	GpuReluF16 << <std::ceil(0.0009765625f * size), 1024 >> > (input, output, size);
-}
-
 int main()
 {
 	printf("cuDNN version: %d.%d.%d\n", CUDNN_MAJOR, CUDNN_MINOR, CUDNN_PATCHLEVEL);
@@ -51,6 +47,9 @@ int main()
 
 	cublasHandle_t cublasHandle;
 	cublasCreate(&cublasHandle);
+
+	cudnnHandle_t cudnnHandle;
+	cudnnCreate(&cudnnHandle);
 	
 	curandGenerator_t curandGenerator;
 	curandCreateGenerator(&curandGenerator, CURAND_RNG_PSEUDO_DEFAULT);
@@ -110,6 +109,26 @@ int main()
 	__half* cpuOutputWeights = new __half[OUTPUT_WEIGHTS_SIZE];
 	__half* cpuHiddenOneBias = new __half[HIDDEN_ONE_SIZE];
 
+
+	cudnnTensorDescriptor_t inputTensorDescriptor;
+	cudnnTensorDescriptor_t hiddenOneTensorDescriptor;
+	cudnnTensorDescriptor_t hiddenTwoTensorDescriptor;
+	cudnnTensorDescriptor_t outputTensorDescriptor;
+
+	cudnnCreateTensorDescriptor(&inputTensorDescriptor);
+	cudnnCreateTensorDescriptor(&hiddenOneTensorDescriptor);
+	cudnnCreateTensorDescriptor(&hiddenTwoTensorDescriptor);
+	cudnnCreateTensorDescriptor(&outputTensorDescriptor);
+	
+	cudnnSetTensor4dDescriptor(inputTensorDescriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, INPUT_SIZE);
+	cudnnSetTensor4dDescriptor(hiddenOneTensorDescriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, HIDDEN_ONE_SIZE);
+	cudnnSetTensor4dDescriptor(hiddenTwoTensorDescriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, HIDDEN_TWO_SIZE);
+	cudnnSetTensor4dDescriptor(outputTensorDescriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, OUTPUT_SIZE);
+
+
+	cudnnActivationDescriptor_t reluActivationDescriptor;
+	cudnnCreateActivationDescriptor(&reluActivationDescriptor);
+	cudnnSetActivationDescriptor(reluActivationDescriptor, CUDNN_ACTIVATION_RELU, CUDNN_NOT_PROPAGATE_NAN, 0.0);
 	
 	cudaMemcpy(cpuHiddenOneWeights, gpuHiddenOneWeights, HIDDEN_ONE_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
 	cudaMemcpy(cpuHiddenTwoWeights, gpuHiddenTwoWeights, HIDDEN_TWO_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
@@ -161,8 +180,13 @@ int main()
 
 	cudaMemcpy(cpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE << 1, cudaMemcpyDeviceToHost);
 	PrintMatrixF16(cpuHiddenOneMatrix, 1, HIDDEN_ONE_SIZE, "Hidden One Matrix");
-
-	ReluF16(gpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE);
+	
+	cudnnActivationForward
+	(
+		cudnnHandle, reluActivationDescriptor,
+		&alphaf32, hiddenOneTensorDescriptor, gpuHiddenOneMatrix,
+		&betaf32, hiddenOneTensorDescriptor, gpuHiddenOneMatrix
+	);
 
 	cudaMemcpy(cpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE << 1, cudaMemcpyDeviceToHost);
 	PrintMatrixF16(cpuHiddenOneMatrix, 1, HIDDEN_ONE_SIZE, "Hidden One Matrix");
@@ -181,8 +205,13 @@ int main()
 
 	cudaMemcpy(cpuHiddenTwoMatrix, gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE << 1, cudaMemcpyDeviceToHost);
 	PrintMatrixF16(cpuHiddenTwoMatrix, 1, HIDDEN_TWO_SIZE, "Hidden Two Matrix");
-
-	ReluF16(gpuHiddenTwoMatrix, gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE);
+	
+	cudnnActivationForward
+	(
+		cudnnHandle, reluActivationDescriptor,
+		&alphaf32, hiddenTwoTensorDescriptor, gpuHiddenTwoMatrix,
+		&betaf32, hiddenTwoTensorDescriptor, gpuHiddenTwoMatrix
+	);
 	
 	cudaMemcpy(cpuHiddenTwoMatrix, gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE << 1, cudaMemcpyDeviceToHost);
 	PrintMatrixF16(cpuHiddenTwoMatrix, 1, HIDDEN_TWO_SIZE, "Hidden Two Matrix");
@@ -202,7 +231,15 @@ int main()
 	cudaMemcpy(cpuOutputMatrix, gpuOutputMatrix, OUTPUT_SIZE << 1, cudaMemcpyDeviceToHost);
 	PrintMatrixF16(cpuOutputMatrix, 1, OUTPUT_SIZE, "Output Matrix");
 	
-	// softmax
+	cudnnSoftmaxForward
+	(
+		cudnnHandle, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
+		&alphaf32, outputTensorDescriptor, gpuOutputMatrix,
+		&betaf32, outputTensorDescriptor, gpuOutputMatrix
+	);
+
+	cudaMemcpy(cpuOutputMatrix, gpuOutputMatrix, OUTPUT_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuOutputMatrix, 1, OUTPUT_SIZE, "Output Matrix");
 	
 	return 0;
 }
