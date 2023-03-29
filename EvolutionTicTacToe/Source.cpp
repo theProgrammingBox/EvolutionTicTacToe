@@ -49,20 +49,27 @@ int main()
 	printf("cuRAND version: %d.%d.%d\n", CURAND_VERSION / 1000, (CURAND_VERSION % 1000) / 100, CURAND_VERSION % 100);
 	printf("\n");
 
-	cudnnHandle_t cudnn;
-	cudnnCreate(&cudnn);
+	cublasHandle_t cublasHandle;
+	cublasCreate(&cublasHandle);
 	
 	curandGenerator_t curandGenerator;
 	curandCreateGenerator(&curandGenerator, CURAND_RNG_PSEUDO_DEFAULT);
 	curandSetPseudoRandomGeneratorSeed(curandGenerator, 1234ULL);
+	
+	const float alphaf32 = 1.0f;
+	const float betaf32 = 0.0f;
 
 	const __half alphaf16 = __float2half(1.0f);
 	const __half betaf16 = __float2half(0.0f);
 
 	const uint32_t INPUT_SIZE = 10;
-	const uint32_t HIDDEN_ONE_SIZE = 1;
-	const uint32_t HIDDEN_TWO_SIZE = 1;
+	const uint32_t HIDDEN_ONE_SIZE = 16;
+	const uint32_t HIDDEN_TWO_SIZE = 16;
 	const uint32_t OUTPUT_SIZE = 9;
+
+	const uint32_t HIDDEN_ONE_WEIGHTS_SIZE = HIDDEN_ONE_SIZE * INPUT_SIZE;
+	const uint32_t HIDDEN_TWO_WEIGHTS_SIZE = HIDDEN_TWO_SIZE * HIDDEN_ONE_SIZE;
+	const uint32_t OUTPUT_WEIGHTS_SIZE = OUTPUT_SIZE * HIDDEN_TWO_SIZE;
 	
 
 	__half* gpuInputMatrix;
@@ -81,27 +88,32 @@ int main()
 	cudaMalloc(&gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE << 1);
 	cudaMalloc(&gpuOutputMatrix, OUTPUT_SIZE << 1);
 	
-	cudaMalloc(&gpuHiddenOneWeights, (INPUT_SIZE * HIDDEN_ONE_SIZE) << 1);
-	cudaMalloc(&gpuHiddenTwoWeights, (HIDDEN_ONE_SIZE * HIDDEN_TWO_SIZE) << 1);
-	cudaMalloc(&gpuOutputWeights, (HIDDEN_TWO_SIZE * OUTPUT_SIZE) << 1);
+	cudaMalloc(&gpuHiddenOneWeights, HIDDEN_ONE_WEIGHTS_SIZE << 1);
+	cudaMalloc(&gpuHiddenTwoWeights, HIDDEN_TWO_WEIGHTS_SIZE << 1);
+	cudaMalloc(&gpuOutputWeights, OUTPUT_WEIGHTS_SIZE << 1);
 	cudaMalloc(&gpuHiddenOneBias, HIDDEN_ONE_SIZE << 1);
 	
 
-	CurandGenerateUniformF16(curandGenerator, gpuHiddenOneWeights, INPUT_SIZE * HIDDEN_ONE_SIZE);
-	CurandGenerateUniformF16(curandGenerator, gpuHiddenTwoWeights, HIDDEN_ONE_SIZE * HIDDEN_TWO_SIZE);
-	CurandGenerateUniformF16(curandGenerator, gpuOutputWeights, HIDDEN_TWO_SIZE * OUTPUT_SIZE);
+	CurandGenerateUniformF16(curandGenerator, gpuHiddenOneWeights, HIDDEN_ONE_WEIGHTS_SIZE);
+	CurandGenerateUniformF16(curandGenerator, gpuHiddenTwoWeights, HIDDEN_TWO_WEIGHTS_SIZE);
+	CurandGenerateUniformF16(curandGenerator, gpuOutputWeights, OUTPUT_WEIGHTS_SIZE);
 	CurandGenerateUniformF16(curandGenerator, gpuHiddenOneBias, HIDDEN_ONE_SIZE);
 
 	
-	__half* cpuHiddenOneWeights = new __half[INPUT_SIZE * HIDDEN_ONE_SIZE];
-	__half* cpuHiddenTwoWeights = new __half[HIDDEN_ONE_SIZE * HIDDEN_TWO_SIZE];
-	__half* cpuOutputWeights = new __half[HIDDEN_TWO_SIZE * OUTPUT_SIZE];
+	__half* cpuInputMatrix = new __half[INPUT_SIZE];
+	__half* cpuHiddenOneMatrix = new __half[HIDDEN_ONE_SIZE];
+	__half* cpuHiddenTwoMatrix = new __half[HIDDEN_TWO_SIZE];
+	__half* cpuOutputMatrix = new __half[OUTPUT_SIZE];
+
+	__half* cpuHiddenOneWeights = new __half[HIDDEN_ONE_WEIGHTS_SIZE];
+	__half* cpuHiddenTwoWeights = new __half[HIDDEN_TWO_WEIGHTS_SIZE];
+	__half* cpuOutputWeights = new __half[OUTPUT_WEIGHTS_SIZE];
 	__half* cpuHiddenOneBias = new __half[HIDDEN_ONE_SIZE];
 
 	
-	cudaMemcpy(cpuHiddenOneWeights, gpuHiddenOneWeights, (INPUT_SIZE * HIDDEN_ONE_SIZE) << 1, cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuHiddenTwoWeights, gpuHiddenTwoWeights, (HIDDEN_ONE_SIZE * HIDDEN_TWO_SIZE) << 1, cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuOutputWeights, gpuOutputWeights, (HIDDEN_TWO_SIZE * OUTPUT_SIZE) << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuHiddenOneWeights, gpuHiddenOneWeights, HIDDEN_ONE_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuHiddenTwoWeights, gpuHiddenTwoWeights, HIDDEN_TWO_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuOutputWeights, gpuOutputWeights, OUTPUT_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
 	cudaMemcpy(cpuHiddenOneBias, gpuHiddenOneBias, HIDDEN_ONE_SIZE << 1, cudaMemcpyDeviceToHost);
 
 	
@@ -112,20 +124,85 @@ int main()
 
 	
 	float* board = new float[9];
-	memset(board, 0, 9 * sizeof(float));
-	float* isPlayerOne = new float[1];
-	isPlayerOne[0] = 1.0f;
+	float* isPlayerOne = new float;
+	memset(board, 0, 9 << 2);
+	*isPlayerOne = 1.0f;
 
-	__half* cpuInputMatrix = new __half[INPUT_SIZE];
 	for (uint32_t i = 0; i < 9; i++)
 		cpuInputMatrix[i] = __float2half(board[i]);
-	cpuInputMatrix[9] = __float2half(isPlayerOne[0]);
+	cpuInputMatrix[9] = __float2half(*isPlayerOne);
+	PrintMatrixF16(cpuInputMatrix, 1, INPUT_SIZE, "Input Matrix");
 	
 	cudaMemcpy(gpuInputMatrix, cpuInputMatrix, INPUT_SIZE << 1, cudaMemcpyHostToDevice);
 	
-	__half* cpuCheckInputMatrix = new __half[INPUT_SIZE];
-	cudaMemcpy(cpuCheckInputMatrix, gpuInputMatrix, INPUT_SIZE << 1, cudaMemcpyDeviceToHost);
-	PrintMatrixF16(cpuCheckInputMatrix, 1, INPUT_SIZE, "Input Matrix");
+	cublasGemmStridedBatchedEx
+	(
+		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+		HIDDEN_ONE_SIZE, 1, INPUT_SIZE,
+		&alphaf16,
+		gpuHiddenOneWeights, CUDA_R_16F, HIDDEN_ONE_SIZE, HIDDEN_ONE_WEIGHTS_SIZE,
+		gpuInputMatrix, CUDA_R_16F, INPUT_SIZE, INPUT_SIZE,
+		&betaf16,
+		gpuHiddenOneMatrix, CUDA_R_16F, HIDDEN_ONE_SIZE, HIDDEN_ONE_SIZE,
+		1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
+	);
+
+	cudaMemcpy(cpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuHiddenOneMatrix, 1, HIDDEN_ONE_SIZE, "Hidden One Matrix");
+
+	cublasAxpyEx
+	(
+		cublasHandle, HIDDEN_ONE_SIZE,
+		&alphaf32, CUDA_R_32F,
+		gpuHiddenOneBias, CUDA_R_16F, 1,
+		gpuHiddenOneMatrix, CUDA_R_16F, 1,
+		CUDA_R_32F
+	);
+
+	cudaMemcpy(cpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuHiddenOneMatrix, 1, HIDDEN_ONE_SIZE, "Hidden One Matrix");
+
+	ReluF16(gpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE);
+
+	cudaMemcpy(cpuHiddenOneMatrix, gpuHiddenOneMatrix, HIDDEN_ONE_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuHiddenOneMatrix, 1, HIDDEN_ONE_SIZE, "Hidden One Matrix");
+
+	cublasGemmStridedBatchedEx
+	(
+		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+		HIDDEN_TWO_SIZE, 1, HIDDEN_ONE_SIZE,
+		&alphaf16,
+		gpuHiddenTwoWeights, CUDA_R_16F, HIDDEN_TWO_SIZE, HIDDEN_TWO_WEIGHTS_SIZE,
+		gpuHiddenOneMatrix, CUDA_R_16F, HIDDEN_ONE_SIZE, HIDDEN_ONE_SIZE,
+		&betaf16,
+		gpuHiddenTwoMatrix, CUDA_R_16F, HIDDEN_TWO_SIZE, HIDDEN_TWO_SIZE,
+		1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
+	);
+
+	cudaMemcpy(cpuHiddenTwoMatrix, gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuHiddenTwoMatrix, 1, HIDDEN_TWO_SIZE, "Hidden Two Matrix");
+
+	ReluF16(gpuHiddenTwoMatrix, gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE);
+	
+	cudaMemcpy(cpuHiddenTwoMatrix, gpuHiddenTwoMatrix, HIDDEN_TWO_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuHiddenTwoMatrix, 1, HIDDEN_TWO_SIZE, "Hidden Two Matrix");
+	
+	cublasGemmStridedBatchedEx
+	(
+		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+		OUTPUT_SIZE, 1, HIDDEN_TWO_SIZE,
+		&alphaf16,
+		gpuOutputWeights, CUDA_R_16F, OUTPUT_SIZE, OUTPUT_WEIGHTS_SIZE,
+		gpuHiddenTwoMatrix, CUDA_R_16F, HIDDEN_TWO_SIZE, HIDDEN_TWO_SIZE,
+		&betaf16,
+		gpuOutputMatrix, CUDA_R_16F, OUTPUT_SIZE, OUTPUT_SIZE,
+		1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
+	);
+
+	cudaMemcpy(cpuOutputMatrix, gpuOutputMatrix, OUTPUT_SIZE << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuOutputMatrix, 1, OUTPUT_SIZE, "Output Matrix");
+	
+	// softmax
 	
 	return 0;
 }
